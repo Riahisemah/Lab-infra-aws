@@ -261,138 +261,114 @@ jobs:
           echo "======================================"
 
   # ============================================================
-  # JOB 2 — ANSIBLE DEPLOYMENT
+  # JOB 2 — Ansible: configure servers & deploy app
   # ============================================================
-
   ansible:
-    name: "⚙️ Configure & Deploy Application"
+    name: "2. Configure & Deploy App"
     runs-on: ubuntu-latest
-
     needs: terraform
-
     if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
 
     steps:
-      # ======================================================
-      # Checkout
-      # ======================================================
-      - name: Checkout Repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      # ======================================================
-      # Install Dependencies
-      # ======================================================
-      - name: Install Ansible Dependencies
+      - name: Install Ansible and dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y \
-            ansible \
-            jq \
-            rsync \
-            python3-pip
-
+          sudo apt-get install -y ansible jq python3-pip rsync
           pip3 install boto3 botocore
 
-      # ======================================================
-      # Configure SSH
-      # ======================================================
-      - name: Configure SSH Key
+      - name: Setup SSH private key
         run: |
           mkdir -p ~/.ssh
-
           echo "${{ secrets.EC2_PRIVATE_KEY }}" > ~/.ssh/deploy_key
-
           chmod 600 ~/.ssh/deploy_key
-
           eval "$(ssh-agent -s)"
           ssh-add ~/.ssh/deploy_key
 
-      # ======================================================
-      # Wait EC2 Instances
-      # ======================================================
-      - name: Wait for EC2 SSH Access
+      - name: Wait for EC2 instances to be ready
         run: |
-
           IPS="${{ needs.terraform.outputs.instance_ips }}"
-
-          echo "Checking SSH connectivity..."
-
+          if [ -z "$IPS" ] || [ "$IPS" = "," ]; then
+            echo "❌ No IPs received from Terraform!"
+            exit 1
+          fi
+          echo "Waiting for SSH on: $IPS"
           for ip in $(echo "$IPS" | tr ',' ' '); do
-
-            echo "Waiting for $ip..."
-
-            for i in {1..20}; do
-
-              if ssh \
-                -o StrictHostKeyChecking=no \
-                -o ConnectTimeout=5 \
-                -i ~/.ssh/deploy_key \
-                ec2-user@$ip "echo connected" 2>/dev/null
-              then
-                echo "✅ $ip reachable"
+            [ -z "$ip" ] && continue
+            echo "Checking $ip..."
+            READY=false
+            for i in $(seq 1 20); do
+              if ssh -o StrictHostKeyChecking=no \
+                     -o ConnectTimeout=5 \
+                     -i ~/.ssh/deploy_key \
+                     ec2-user@$ip "echo ready" 2>/dev/null; then
+                echo "✅ $ip is ready"
+                READY=true
                 break
               fi
-
-              echo "Retry $i/20..."
+              echo "  Attempt $i/20 — retrying in 15s..."
               sleep 15
             done
+            if [ "$READY" = false ]; then
+              echo "❌ Could not reach $ip after 20 attempts"
+              exit 1
+            fi
           done
 
-      # ======================================================
-      # Generate Inventory
-      # ======================================================
-      - name: Generate Ansible Inventory
+      - name: Generate Ansible inventory
         run: |
-
           IPS="${{ needs.terraform.outputs.instance_ips }}"
-
-          cat > ansible/inventory.ini <<EOF
-          [web]
-          EOF
-
+          mkdir -p ansible
+          echo "[web]" > ansible/inventory.ini
           for ip in $(echo "$IPS" | tr ',' ' '); do
+            [ -z "$ip" ] && continue
             echo "$ip ansible_user=ec2-user ansible_ssh_private_key_file=~/.ssh/deploy_key" \
               >> ansible/inventory.ini
           done
-
-          cat >> ansible/inventory.ini <<EOF
-
-          [web:vars]
-          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
-          EOF
-
-          echo "======================================"
+          echo "" >> ansible/inventory.ini
+          echo "[web:vars]" >> ansible/inventory.ini
+          echo "ansible_ssh_common_args='-o StrictHostKeyChecking=no'" >> ansible/inventory.ini
+          echo "ansible_python_interpreter=/usr/bin/python3" >> ansible/inventory.ini
+          echo "Generated inventory:"
           cat ansible/inventory.ini
-          echo "======================================"
 
-      # ======================================================
-      # Bootstrap Python
-      # ======================================================
-      - name: Bootstrap Python
+      - name: Fix SELinux and Bootstrap Python
         run: |
+          # First, disable SELinux using raw module (doesn't need Python)
           ansible web \
             -i ansible/inventory.ini \
             -m raw \
-            -a "sudo yum install -y python3" \
+            -a "sudo setenforce 0 && sudo sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config" \
+            --timeout=30 || true
+
+          # Install Python3 if missing
+          ansible web \
+            -i ansible/inventory.ini \
+            -m raw \
+            -a "sudo yum install -y python3 python3-pip" \
+            --timeout=30
+
+          # Test Python works
+          ansible web \
+            -i ansible/inventory.ini \
+            -m raw \
+            -a "python3 -c 'import json; print(\"Python OK\")'" \
             --timeout=30
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
 
-      # ======================================================
-      # Test Connectivity
-      # ======================================================
-      - name: Test Ansible Connectivity
+      - name: Test Ansible connectivity
         run: |
           ansible web \
             -i ansible/inventory.ini \
-            -m ping
+            -m ping \
+            --timeout=30
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
 
-      # ======================================================
-      # Deploy Application
-      # ======================================================
-      - name: Run Deployment Playbook
+      - name: Run deployment playbook
         run: |
           ansible-playbook \
             -i ansible/inventory.ini \
@@ -400,22 +376,16 @@ jobs:
             -v
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_CONFIG: ansible/ansible.cfg
 
-      # ======================================================
-      # Deployment Success
-      # ======================================================
-      - name: Display Application URL
+      - name: Print app URL
         run: |
           echo ""
-          echo "======================================"
-          echo "🚀 DEPLOYMENT SUCCESSFUL"
-          echo ""
-          echo "🌍 Application URL:"
-          echo "http://${{ needs.terraform.outputs.alb_dns }}"
-          echo ""
-          echo "⏳ ALB health checks may take 1-2 mins"
-          echo "======================================"
-
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║  🚀 Deployment complete!                         ║"
+          echo "║  App URL: http://${{ needs.terraform.outputs.alb_dns }}"
+          echo "║  Note: ALB may take 1-2 min for health checks   ║"
+          echo "╚══════════════════════════════════════════════════╝"
   # ============================================================
   # JOB 3 — DESTROY INFRASTRUCTURE
   # ============================================================

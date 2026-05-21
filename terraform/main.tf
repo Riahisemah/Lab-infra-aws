@@ -209,7 +209,8 @@ resource "aws_instance" "web" {
   instance_type = var.instance_type
 
   # Alternate between private subnets for HA
-  subnet_id = count.index % 2 == 0 ? aws_subnet.private_a.id : aws_subnet.private_b.id
+  subnet_id                   = count.index % 2 == 0 ? aws_subnet.public_a.id : aws_subnet.public_b.id
+  associate_public_ip_address = true
 
   key_name               = aws_key_pair.deployer.key_name
   vpc_security_group_ids = [aws_security_group.ec2.id]

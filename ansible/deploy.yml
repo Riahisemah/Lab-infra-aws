@@ -9,7 +9,7 @@
   tasks:
     - name: Install required packages
       yum:
-        name: [docker, git, curl]
+        name: [docker, git, curl, python3-pip]
         state: present
 
     - name: Start Docker
@@ -45,7 +45,8 @@
         group: ec2-user
 
     - name: Build and start containers
-      shell: docker-compose up -d --build --force-recreate
+      shell: |
+        /usr/local/bin/docker-compose up -d --build --force-recreate
       args:
         chdir: /opt/ecommerce
       become_user: ec2-user
@@ -60,7 +61,7 @@
       until: result.status == 200
 
     - name: Show running containers
-      shell: docker-compose ps
+      command: /usr/local/bin/docker-compose ps
       args:
         chdir: /opt/ecommerce
       become_user: ec2-user

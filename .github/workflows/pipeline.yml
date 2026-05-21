@@ -343,14 +343,21 @@ jobs:
             -a "sudo setenforce 0 && sudo sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config" \
             --timeout=30 || true
 
-          # Install Python3 if missing
+          # Install Python3 and development tools
           ansible web \
             -i ansible/inventory.ini \
             -m raw \
-            -a "sudo yum install -y python3 python3-pip" \
+            -a "sudo yum install -y python3 python3-pip python3-devel gcc git" \
             --timeout=30
 
-          # Test Python works
+          # Upgrade pip
+          ansible web \
+            -i ansible/inventory.ini \
+            -m raw \
+            -a "sudo pip3 install --upgrade pip setuptools wheel" \
+            --timeout=30
+
+          # Test Python works with JSON
           ansible web \
             -i ansible/inventory.ini \
             -m raw \
@@ -358,16 +365,6 @@ jobs:
             --timeout=30
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
-
-      - name: Test Ansible connectivity
-        run: |
-          ansible web \
-            -i ansible/inventory.ini \
-            -m ping \
-            --timeout=30
-        env:
-          ANSIBLE_HOST_KEY_CHECKING: "False"
-
       - name: Run deployment playbook
         run: |
           ansible-playbook \

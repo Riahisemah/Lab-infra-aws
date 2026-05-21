@@ -8,6 +8,11 @@
     ansible_ssh_private_key_file: ~/.ssh/deploy_key
 
   tasks:
+    - name: Disable SELinux
+      raw: |
+        sudo setenforce 0 || true
+        sudo sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
+      become: yes
     - name: Check if Python3 is installed
       raw: which python3
       register: python_check

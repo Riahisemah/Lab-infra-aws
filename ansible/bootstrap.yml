@@ -1,0 +1,31 @@
+---
+- name: Bootstrap EC2 instances with Python
+  hosts: web
+  gather_facts: no
+  vars:
+    ansible_connection: ssh
+    ansible_user: ec2-user
+    ansible_ssh_private_key_file: ~/.ssh/deploy_key
+
+  tasks:
+    - name: Check if Python3 is installed
+      raw: which python3
+      register: python_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install Python3 on Amazon Linux
+      raw: |
+        sudo yum update -y
+        sudo yum install -y python3 python3-pip
+        sudo alternatives --set python /usr/bin/python3 2>/dev/null || true
+      when: python_check.rc != 0
+
+    - name: Verify Python3 can import json
+      raw: python3 -c "import json; print('JSON module available')"
+      register: json_check
+      changed_when: false
+
+    - name: Display status
+      debug:
+        msg: "✅ Python bootstrapped successfully"

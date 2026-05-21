@@ -1,27 +1,38 @@
-name: Full DevOps Pipeline
+name: Full DevOps CI/CD Pipeline
 
 on:
   push:
-    branches: ["main"]
+    branches:
+      - main
+
   workflow_dispatch:
     inputs:
       action:
-        description: "Action to perform"
+        description: "Choose pipeline action"
         required: true
-        default: "deploy"
+        default: deploy
         type: choice
         options:
           - deploy
           - destroy
 
+# ============================================================
+# GLOBAL ENV VARIABLES
+# ============================================================
+env:
+  TERRAFORM_VERSION: "1.7.0"
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+# ============================================================
+# JOB 1 — TERRAFORM
+# ============================================================
 jobs:
-  # ============================================================
-  # JOB 1 — Terraform: provision AWS infrastructure
-  # ============================================================
   terraform:
-    name: "1. Provision Infrastructure"
+    name: "🚀 Terraform Infrastructure"
     runs-on: ubuntu-latest
+
     if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
+
     defaults:
       run:
         working-directory: terraform
@@ -31,282 +42,220 @@ jobs:
       alb_dns: ${{ steps.export.outputs.alb_dns }}
 
     steps:
-      - name: Checkout code
+      # ======================================================
+      # Checkout
+      # ======================================================
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      # ======================================================
+      # AWS Credentials
+      # ======================================================
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
+      # ======================================================
+      # Terraform Setup
+      # ======================================================
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.7.0"
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
 
+      # ======================================================
+      # Terraform Init
+      # ======================================================
       - name: Terraform Init
         run: terraform init
 
-      # -------------------------------------------------------
-      # CLEANUP FIRST — before plan & apply
-      # Deletes all leftover resources from previous failed runs
-      # -------------------------------------------------------
-      - name: Cleanup conflicting AWS resources
-        run: |
-          echo "========================================="
-          echo "🧹 Cleaning up leftover AWS resources..."
-          echo "========================================="
-
-          # 1. Delete ALB listeners → ALB → wait
-          ALB_ARN=$(aws elbv2 describe-load-balancers \
-            --names "ecommerce-lab-alb" \
-            --query 'LoadBalancers[0].LoadBalancerArn' \
-            --output text 2>/dev/null || echo "None")
-          if [ "$ALB_ARN" != "None" ] && [ ! -z "$ALB_ARN" ]; then
-            echo "🗑️  Deleting ALB listeners..."
-            for L in $(aws elbv2 describe-listeners \
-              --load-balancer-arn "$ALB_ARN" \
-              --query 'Listeners[].ListenerArn' \
-              --output text 2>/dev/null); do
-              aws elbv2 delete-listener --listener-arn "$L"
-            done
-            echo "🗑️  Deleting ALB..."
-            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN"
-            aws elbv2 wait load-balancers-deleted --load-balancer-arns "$ALB_ARN"
-            echo "✅ ALB deleted"
-          else
-            echo "ℹ️  No ALB found"
-          fi
-
-          # 2. Delete Target Group
-          TG_ARN=$(aws elbv2 describe-target-groups \
-            --names "ecommerce-lab-tg" \
-            --query 'TargetGroups[0].TargetGroupArn' \
-            --output text 2>/dev/null || echo "None")
-          if [ "$TG_ARN" != "None" ] && [ ! -z "$TG_ARN" ]; then
-            echo "🗑️  Deleting Target Group..."
-            aws elbv2 delete-target-group --target-group-arn "$TG_ARN"
-            echo "✅ Target Group deleted"
-          else
-            echo "ℹ️  No Target Group found"
-          fi
-
-          # 3. Delete Key Pair
-          aws ec2 delete-key-pair --key-name "ecommerce-lab-key" 2>/dev/null \
-            && echo "✅ Key Pair deleted" || echo "ℹ️  No Key Pair found"
-
-          # 4. Terminate EC2 instances and WAIT
-          INSTANCE_IDS=$(aws ec2 describe-instances \
-            --filters \
-              "Name=tag:Name,Values=ecommerce-lab-web-*" \
-              "Name=instance-state-name,Values=running,stopped,pending" \
-            --query 'Reservations[].Instances[].InstanceId' \
-            --output text 2>/dev/null || echo "")
-          if [ ! -z "$INSTANCE_IDS" ]; then
-            echo "🗑️  Terminating EC2 instances: $INSTANCE_IDS"
-            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS > /dev/null
-            aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
-            echo "✅ EC2 instances terminated"
-          else
-            echo "ℹ️  No EC2 instances found"
-          fi
-
-          # 5. Delete ALL old ecommerce-lab VPCs and their dependencies
-          VPC_IDS=$(aws ec2 describe-vpcs \
-            --filters "Name=tag:Name,Values=ecommerce-lab-vpc" \
-            --query 'Vpcs[].VpcId' \
-            --output text 2>/dev/null || echo "")
-          for VPC_ID in $VPC_IDS; do
-            echo "🗑️  Cleaning VPC: $VPC_ID"
-
-            # Delete NAT Gateways and WAIT (they take time)
-            NAT_IDS=$(aws ec2 describe-nat-gateways \
-              --filter "Name=vpc-id,Values=$VPC_ID" \
-              --query 'NatGateways[?State!=`deleted`].NatGatewayId' \
-              --output text 2>/dev/null || echo "")
-            for NAT in $NAT_IDS; do
-              echo "  🗑️  Deleting NAT Gateway: $NAT"
-              aws ec2 delete-nat-gateway --nat-gateway-id $NAT > /dev/null
-            done
-            if [ ! -z "$NAT_IDS" ]; then
-              echo "  ⏳ Waiting for NAT Gateways to delete (up to 60s)..."
-              sleep 60
-            fi
-
-            # Release EIPs associated with this VPC
-            for EIP in $(aws ec2 describe-addresses \
-              --filters "Name=domain,Values=vpc" \
-              --query 'Addresses[].AllocationId' \
-              --output text 2>/dev/null); do
-              aws ec2 release-address --allocation-id $EIP 2>/dev/null || true
-            done
-
-            # Detach and delete Internet Gateways
-            for IGW in $(aws ec2 describe-internet-gateways \
-              --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
-              --query 'InternetGateways[].InternetGatewayId' \
-              --output text 2>/dev/null); do
-              aws ec2 detach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC_ID
-              aws ec2 delete-internet-gateway --internet-gateway-id $IGW
-            done
-
-            # Delete Subnets
-            for S in $(aws ec2 describe-subnets \
-              --filters "Name=vpc-id,Values=$VPC_ID" \
-              --query 'Subnets[].SubnetId' \
-              --output text 2>/dev/null); do
-              aws ec2 delete-subnet --subnet-id $S 2>/dev/null || true
-            done
-
-            # Delete Security Groups (non-default)
-            for SG in $(aws ec2 describe-security-groups \
-              --filters "Name=vpc-id,Values=$VPC_ID" \
-              --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
-              --output text 2>/dev/null); do
-              aws ec2 delete-security-group --group-id $SG 2>/dev/null || true
-            done
-
-            # Delete non-main Route Tables
-            for RT in $(aws ec2 describe-route-tables \
-              --filters "Name=vpc-id,Values=$VPC_ID" \
-              --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' \
-              --output text 2>/dev/null); do
-              aws ec2 delete-route-table --route-table-id $RT 2>/dev/null || true
-            done
-
-            # Finally delete the VPC
-            aws ec2 delete-vpc --vpc-id $VPC_ID \
-              && echo "✅ VPC $VPC_ID deleted" \
-              || echo "⚠️  Could not delete VPC $VPC_ID (may have dependencies)"
-          done
-
-          echo "========================================="
-          echo "✅ Cleanup complete!"
-          echo "========================================="
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
-
-      - name: Terraform Format check
+      # ======================================================
+      # Terraform Format Check
+      # ======================================================
+      - name: Terraform Format Check
         run: terraform fmt -check
         continue-on-error: true
 
+      # ======================================================
+      # Terraform Validate
+      # ======================================================
       - name: Terraform Validate
         run: terraform validate
 
+      # ======================================================
+      # Terraform Plan
+      # ======================================================
       - name: Terraform Plan
         run: |
           terraform plan \
             -var="ec2_public_key=${{ secrets.EC2_PUBLIC_KEY }}" \
             -out=tfplan
-        env:
-          TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
 
+      # ======================================================
+      # Terraform Apply
+      # ======================================================
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
 
-      - name: Export outputs for Ansible
+      # ======================================================
+      # Export Terraform Outputs
+      # ======================================================
+      - name: Export Outputs
         id: export
         run: |
+
           IPS=$(terraform output -json instance_public_ips \
             | jq -r '.[]' \
             | tr '\n' ',' \
             | sed 's/,$//')
-          echo "instance_ips=$IPS" >> $GITHUB_OUTPUT
 
           ALB=$(terraform output -raw alb_dns_name)
+
+          echo "instance_ips=$IPS" >> $GITHUB_OUTPUT
           echo "alb_dns=$ALB" >> $GITHUB_OUTPUT
 
-          echo "✅ EC2 IPs: $IPS"
-          echo "✅ ALB DNS: $ALB"
+          echo "======================================"
+          echo "✅ EC2 Instances: $IPS"
+          echo "✅ Load Balancer : $ALB"
+          echo "======================================"
 
   # ============================================================
-  # JOB 2 — Ansible: configure servers & deploy app
+  # JOB 2 — ANSIBLE DEPLOYMENT
   # ============================================================
+
   ansible:
-    name: "2. Configure & Deploy App"
+    name: "⚙️ Configure & Deploy Application"
     runs-on: ubuntu-latest
+
     needs: terraform
+
     if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
 
     steps:
-      - name: Checkout code
+      # ======================================================
+      # Checkout
+      # ======================================================
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Ansible and dependencies
+      # ======================================================
+      # Install Dependencies
+      # ======================================================
+      - name: Install Ansible Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ansible jq python3-pip rsync
+          sudo apt-get install -y \
+            ansible \
+            jq \
+            rsync \
+            python3-pip
+
           pip3 install boto3 botocore
 
-      - name: Setup SSH private key
+      # ======================================================
+      # Configure SSH
+      # ======================================================
+      - name: Configure SSH Key
         run: |
           mkdir -p ~/.ssh
+
           echo "${{ secrets.EC2_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+
           chmod 600 ~/.ssh/deploy_key
+
           eval "$(ssh-agent -s)"
           ssh-add ~/.ssh/deploy_key
 
-      - name: Wait for EC2 instances to be ready
+      # ======================================================
+      # Wait EC2 Instances
+      # ======================================================
+      - name: Wait for EC2 SSH Access
         run: |
+
           IPS="${{ needs.terraform.outputs.instance_ips }}"
-          if [ -z "$IPS" ] || [ "$IPS" = "," ]; then
-            echo "❌ No IPs received from Terraform!"
-            exit 1
-          fi
-          echo "Waiting for SSH on: $IPS"
+
+          echo "Checking SSH connectivity..."
+
           for ip in $(echo "$IPS" | tr ',' ' '); do
-            [ -z "$ip" ] && continue
-            echo "Checking $ip..."
-            READY=false
-            for i in $(seq 1 20); do
-              if ssh -o StrictHostKeyChecking=no \
-                     -o ConnectTimeout=5 \
-                     -i ~/.ssh/deploy_key \
-                     ec2-user@$ip "echo ready" 2>/dev/null; then
-                echo "✅ $ip is ready"
-                READY=true
+
+            echo "Waiting for $ip..."
+
+            for i in {1..20}; do
+
+              if ssh \
+                -o StrictHostKeyChecking=no \
+                -o ConnectTimeout=5 \
+                -i ~/.ssh/deploy_key \
+                ec2-user@$ip "echo connected" 2>/dev/null
+              then
+                echo "✅ $ip reachable"
                 break
               fi
-              echo "  Attempt $i/20 — retrying in 15s..."
+
+              echo "Retry $i/20..."
               sleep 15
             done
-            if [ "$READY" = false ]; then
-              echo "❌ Could not reach $ip after 20 attempts"
-              exit 1
-            fi
           done
 
-      - name: Generate Ansible inventory
+      # ======================================================
+      # Generate Inventory
+      # ======================================================
+      - name: Generate Ansible Inventory
         run: |
+
           IPS="${{ needs.terraform.outputs.instance_ips }}"
-          echo "[web]" > ansible/inventory.ini
+
+          cat > ansible/inventory.ini <<EOF
+          [web]
+          EOF
+
           for ip in $(echo "$IPS" | tr ',' ' '); do
-            [ -z "$ip" ] && continue
             echo "$ip ansible_user=ec2-user ansible_ssh_private_key_file=~/.ssh/deploy_key" \
               >> ansible/inventory.ini
           done
-          echo "" >> ansible/inventory.ini
-          echo "[web:vars]" >> ansible/inventory.ini
-          echo "ansible_ssh_common_args='-o StrictHostKeyChecking=no'" >> ansible/inventory.ini
-          echo "Generated inventory:"
-          cat ansible/inventory.ini
 
-      - name: Test Ansible connectivity
+          cat >> ansible/inventory.ini <<EOF
+
+          [web:vars]
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          EOF
+
+          echo "======================================"
+          cat ansible/inventory.ini
+          echo "======================================"
+
+      # ======================================================
+      # Bootstrap Python
+      # ======================================================
+      - name: Bootstrap Python
         run: |
           ansible web \
             -i ansible/inventory.ini \
-            -m ping \
+            -m raw \
+            -a "sudo yum install -y python3" \
             --timeout=30
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
 
-      - name: Run deployment playbook
+      # ======================================================
+      # Test Connectivity
+      # ======================================================
+      - name: Test Ansible Connectivity
+        run: |
+          ansible web \
+            -i ansible/inventory.ini \
+            -m ping
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+
+      # ======================================================
+      # Deploy Application
+      # ======================================================
+      - name: Run Deployment Playbook
         run: |
           ansible-playbook \
             -i ansible/inventory.ini \
@@ -314,55 +263,82 @@ jobs:
             -v
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
-          ANSIBLE_CONFIG: ansible/ansible.cfg
 
-      - name: Print app URL
+      # ======================================================
+      # Deployment Success
+      # ======================================================
+      - name: Display Application URL
         run: |
           echo ""
-          echo "╔══════════════════════════════════════════════════╗"
-          echo "║  🚀 Deployment complete!                         ║"
-          echo "║  App URL: http://${{ needs.terraform.outputs.alb_dns }}"
-          echo "║  Note: ALB may take 1-2 min for health checks   ║"
-          echo "╚══════════════════════════════════════════════════╝"
+          echo "======================================"
+          echo "🚀 DEPLOYMENT SUCCESSFUL"
+          echo ""
+          echo "🌍 Application URL:"
+          echo "http://${{ needs.terraform.outputs.alb_dns }}"
+          echo ""
+          echo "⏳ ALB health checks may take 1-2 mins"
+          echo "======================================"
 
   # ============================================================
-  # JOB 3 — Destroy (manual trigger only)
+  # JOB 3 — DESTROY INFRASTRUCTURE
   # ============================================================
+
   destroy:
-    name: "3. Destroy Infrastructure"
+    name: "🔥 Destroy Infrastructure"
     runs-on: ubuntu-latest
+
     if: github.event.inputs.action == 'destroy'
+
     defaults:
       run:
         working-directory: terraform
 
     steps:
-      - name: Checkout code
+      # ======================================================
+      # Checkout
+      # ======================================================
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      # ======================================================
+      # AWS Credentials
+      # ======================================================
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
+      # ======================================================
+      # Setup Terraform
+      # ======================================================
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.7.0"
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
 
+      # ======================================================
+      # Terraform Init
+      # ======================================================
       - name: Terraform Init
         run: terraform init
 
+      # ======================================================
+      # Terraform Destroy
+      # ======================================================
       - name: Terraform Destroy
         run: |
           terraform destroy \
-            -var="ec2_public_key=placeholder" \
+            -var="ec2_public_key=dummy" \
             -auto-approve
-        env:
-          TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
 
-      - name: Confirm destruction
-        run: echo "✅ All AWS resources have been destroyed."
+      # ======================================================
+      # Success Message
+      # ======================================================
+      - name: Confirm Destruction
+        run: |
+          echo "======================================"
+          echo "🔥 Infrastructure Destroyed Successfully"
+          echo "======================================"

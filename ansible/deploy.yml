@@ -7,9 +7,9 @@
     ansible_python_interpreter: /usr/bin/python3
 
   tasks:
-    - name: Install required packages
-      yum:
-        name: [docker, git, curl, python3-pip]
+    - name: Install required packages (AL2023 uses dnf)
+      dnf:
+        name: [docker, git, curl]
         state: present
 
     - name: Start Docker
@@ -45,8 +45,7 @@
         group: ec2-user
 
     - name: Build and start containers
-      shell: |
-        /usr/local/bin/docker-compose up -d --build --force-recreate
+      shell: docker-compose up -d --build --force-recreate
       args:
         chdir: /opt/ecommerce
       become_user: ec2-user
@@ -61,7 +60,7 @@
       until: result.status == 200
 
     - name: Show running containers
-      command: /usr/local/bin/docker-compose ps
+      shell: docker-compose ps
       args:
         chdir: /opt/ecommerce
       become_user: ec2-user

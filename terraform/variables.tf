@@ -24,9 +24,9 @@ variable "instance_type" {
 
 # Amazon Linux 2 in us-east-1 (update if you change region)
 variable "ami_id" {
-  description = "AMI ID for Amazon Linux 2"
+  description = "AMI ID for Amazon Linux 2023"
   type        = string
-  default     = "ami-0c02fb55956c7d316"
+  default     = "ami-0e1d30f2c40c4c701"  # Amazon Linux 2023 in us-east-1
 }
 
 # Your SSH public key — injected via GitHub Secret EC2_PUBLIC_KEY

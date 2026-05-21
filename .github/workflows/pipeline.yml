@@ -333,35 +333,20 @@ jobs:
           echo "ansible_python_interpreter=/usr/bin/python3" >> ansible/inventory.ini
           echo "Generated inventory:"
           cat ansible/inventory.ini
-
-      - name: Fix SELinux and Bootstrap Python
+      - name: Fix SELinux on AL2023
         run: |
-          # First, disable SELinux using raw module (doesn't need Python)
+          # Disable SELinux (AL2023 has it enforcing by default)
           ansible web \
             -i ansible/inventory.ini \
             -m raw \
             -a "sudo setenforce 0 && sudo sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config" \
             --timeout=30 || true
 
-          # Install Python3 and development tools
+          # Verify Python works (already there!)
           ansible web \
             -i ansible/inventory.ini \
             -m raw \
-            -a "sudo yum install -y python3 python3-pip python3-devel gcc git" \
-            --timeout=30
-
-          # Upgrade pip
-          ansible web \
-            -i ansible/inventory.ini \
-            -m raw \
-            -a "sudo pip3 install --upgrade pip setuptools wheel" \
-            --timeout=30
-
-          # Test Python works with JSON
-          ansible web \
-            -i ansible/inventory.ini \
-            -m raw \
-            -a "python3 -c 'import json; print(\"Python OK\")'" \
+            -a "python3 --version && python3 -c 'import json; print(\"Python OK\")'" \
             --timeout=30
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"

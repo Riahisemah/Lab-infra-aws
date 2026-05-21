@@ -2,6 +2,7 @@
 - name: Deploy e-commerce application
   hosts: web
   become: yes
+  gather_facts: no # ADD THIS temporarily
 
   tasks:
     - name: Install required packages

@@ -72,6 +72,143 @@ jobs:
       # ======================================================
       - name: Terraform Init
         run: terraform init
+      - name: Cleanup conflicting AWS resources
+        run: |
+          echo "========================================="
+          echo "🧹 Cleaning up leftover AWS resources..."
+          echo "========================================="
+
+          # 1. Delete ALB listeners → ALB → wait
+          ALB_ARN=$(aws elbv2 describe-load-balancers \
+            --names "ecommerce-lab-alb" \
+            --query 'LoadBalancers[0].LoadBalancerArn' \
+            --output text 2>/dev/null || echo "None")
+          if [ "$ALB_ARN" != "None" ] && [ ! -z "$ALB_ARN" ]; then
+            echo "🗑️  Deleting ALB listeners..."
+            for L in $(aws elbv2 describe-listeners \
+              --load-balancer-arn "$ALB_ARN" \
+              --query 'Listeners[].ListenerArn' \
+              --output text 2>/dev/null); do
+              aws elbv2 delete-listener --listener-arn "$L"
+            done
+            echo "🗑️  Deleting ALB..."
+            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN"
+            aws elbv2 wait load-balancers-deleted --load-balancer-arns "$ALB_ARN"
+            echo "✅ ALB deleted"
+          else
+            echo "ℹ️  No ALB found"
+          fi
+
+          # 2. Delete Target Group
+          TG_ARN=$(aws elbv2 describe-target-groups \
+            --names "ecommerce-lab-tg" \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text 2>/dev/null || echo "None")
+          if [ "$TG_ARN" != "None" ] && [ ! -z "$TG_ARN" ]; then
+            echo "🗑️  Deleting Target Group..."
+            aws elbv2 delete-target-group --target-group-arn "$TG_ARN"
+            echo "✅ Target Group deleted"
+          else
+            echo "ℹ️  No Target Group found"
+          fi
+
+          # 3. Delete Key Pair
+          aws ec2 delete-key-pair --key-name "ecommerce-lab-key" 2>/dev/null \
+            && echo "✅ Key Pair deleted" || echo "ℹ️  No Key Pair found"
+
+          # 4. Terminate EC2 instances and WAIT
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Name,Values=ecommerce-lab-web-*" \
+              "Name=instance-state-name,Values=running,stopped,pending" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text 2>/dev/null || echo "")
+          if [ ! -z "$INSTANCE_IDS" ]; then
+            echo "🗑️  Terminating EC2 instances: $INSTANCE_IDS"
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS > /dev/null
+            aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
+            echo "✅ EC2 instances terminated"
+          else
+            echo "ℹ️  No EC2 instances found"
+          fi
+
+          # 5. Delete ALL old ecommerce-lab VPCs and their dependencies
+          VPC_IDS=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=ecommerce-lab-vpc" \
+            --query 'Vpcs[].VpcId' \
+            --output text 2>/dev/null || echo "")
+          for VPC_ID in $VPC_IDS; do
+            echo "🗑️  Cleaning VPC: $VPC_ID"
+
+            # Delete NAT Gateways and WAIT (they take time)
+            NAT_IDS=$(aws ec2 describe-nat-gateways \
+              --filter "Name=vpc-id,Values=$VPC_ID" \
+              --query 'NatGateways[?State!=`deleted`].NatGatewayId' \
+              --output text 2>/dev/null || echo "")
+            for NAT in $NAT_IDS; do
+              echo "  🗑️  Deleting NAT Gateway: $NAT"
+              aws ec2 delete-nat-gateway --nat-gateway-id $NAT > /dev/null
+            done
+            if [ ! -z "$NAT_IDS" ]; then
+              echo "  ⏳ Waiting for NAT Gateways to delete (up to 60s)..."
+              sleep 60
+            fi
+
+            # Release EIPs associated with this VPC
+            for EIP in $(aws ec2 describe-addresses \
+              --filters "Name=domain,Values=vpc" \
+              --query 'Addresses[].AllocationId' \
+              --output text 2>/dev/null); do
+              aws ec2 release-address --allocation-id $EIP 2>/dev/null || true
+            done
+
+            # Detach and delete Internet Gateways
+            for IGW in $(aws ec2 describe-internet-gateways \
+              --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+              --query 'InternetGateways[].InternetGatewayId' \
+              --output text 2>/dev/null); do
+              aws ec2 detach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC_ID
+              aws ec2 delete-internet-gateway --internet-gateway-id $IGW
+            done
+
+            # Delete Subnets
+            for S in $(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'Subnets[].SubnetId' \
+              --output text 2>/dev/null); do
+              aws ec2 delete-subnet --subnet-id $S 2>/dev/null || true
+            done
+
+            # Delete Security Groups (non-default)
+            for SG in $(aws ec2 describe-security-groups \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+              --output text 2>/dev/null); do
+              aws ec2 delete-security-group --group-id $SG 2>/dev/null || true
+            done
+
+            # Delete non-main Route Tables
+            for RT in $(aws ec2 describe-route-tables \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' \
+              --output text 2>/dev/null); do
+              aws ec2 delete-route-table --route-table-id $RT 2>/dev/null || true
+            done
+
+            # Finally delete the VPC
+            aws ec2 delete-vpc --vpc-id $VPC_ID \
+              && echo "✅ VPC $VPC_ID deleted" \
+              || echo "⚠️  Could not delete VPC $VPC_ID (may have dependencies)"
+          done
+
+          echo "========================================="
+          echo "✅ Cleanup complete!"
+          echo "========================================="
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
 
       # ======================================================
       # Terraform Format Check

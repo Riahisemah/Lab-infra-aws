@@ -24,9 +24,8 @@
         groups: docker
         append: yes
 
-    - name: Force docker group refresh for ec2-user
-      shell: |
-        sg docker -c "true"
+    - name: Force docker group refresh
+      shell: sg docker -c "true"
       become_user: ec2-user
       ignore_errors: yes
 
@@ -43,6 +42,20 @@
         owner: ec2-user
         group: ec2-user
 
+    - name: Copy app source code
+      synchronize:
+        src: ../app/
+        dest: /opt/ecommerce/app/
+        delete: yes
+      delegate_to: localhost
+
+    - name: Copy nginx configuration
+      synchronize:
+        src: ../nginx/
+        dest: /opt/ecommerce/nginx/
+        delete: yes
+      delegate_to: localhost
+
     - name: Copy docker-compose file
       copy:
         src: ../docker-compose.yml
@@ -50,7 +63,7 @@
         owner: ec2-user
         group: ec2-user
 
-    - name: Build and start containers (using sg to use docker group)
+    - name: Build and start containers
       shell: |
         sg docker -c "/usr/local/bin/docker-compose up -d --build --force-recreate"
       args:
@@ -66,7 +79,7 @@
       register: result
       until: result.status == 200
 
-    - name: Show running containers (using sg to use docker group)
+    - name: Show running containers
       shell: |
         sg docker -c "/usr/local/bin/docker-compose ps"
       args:

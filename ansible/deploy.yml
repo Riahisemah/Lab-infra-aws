@@ -9,8 +9,9 @@
   tasks:
     - name: Install required packages (AL2023 uses dnf)
       dnf:
-        name: [docker, git, curl]
+        name: [docker, git]
         state: present
+      # REMOVED curl from this list - it's pre-installed!
 
     - name: Start Docker
       service:

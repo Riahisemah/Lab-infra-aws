@@ -1,8 +1,5 @@
 name: Full DevOps Pipeline
 
-# ============================================================
-# Triggers
-# ============================================================
 on:
   push:
     branches: ["main"]
@@ -17,10 +14,10 @@ on:
           - deploy
           - destroy
 
-# ============================================================
-# JOB 1 — Terraform: provision AWS infrastructure
-# ============================================================
 jobs:
+  # ============================================================
+  # JOB 1 — Terraform: provision AWS infrastructure
+  # ============================================================
   terraform:
     name: "1. Provision Infrastructure"
     runs-on: ubuntu-latest
@@ -53,6 +50,148 @@ jobs:
       - name: Terraform Init
         run: terraform init
 
+      # -------------------------------------------------------
+      # CLEANUP FIRST — before plan & apply
+      # Deletes all leftover resources from previous failed runs
+      # -------------------------------------------------------
+      - name: Cleanup conflicting AWS resources
+        run: |
+          echo "========================================="
+          echo "🧹 Cleaning up leftover AWS resources..."
+          echo "========================================="
+
+          # 1. Delete ALB listeners → ALB → wait
+          ALB_ARN=$(aws elbv2 describe-load-balancers \
+            --names "ecommerce-lab-alb" \
+            --query 'LoadBalancers[0].LoadBalancerArn' \
+            --output text 2>/dev/null || echo "None")
+          if [ "$ALB_ARN" != "None" ] && [ ! -z "$ALB_ARN" ]; then
+            echo "🗑️  Deleting ALB listeners..."
+            for L in $(aws elbv2 describe-listeners \
+              --load-balancer-arn "$ALB_ARN" \
+              --query 'Listeners[].ListenerArn' \
+              --output text 2>/dev/null); do
+              aws elbv2 delete-listener --listener-arn "$L"
+            done
+            echo "🗑️  Deleting ALB..."
+            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN"
+            aws elbv2 wait load-balancers-deleted --load-balancer-arns "$ALB_ARN"
+            echo "✅ ALB deleted"
+          else
+            echo "ℹ️  No ALB found"
+          fi
+
+          # 2. Delete Target Group
+          TG_ARN=$(aws elbv2 describe-target-groups \
+            --names "ecommerce-lab-tg" \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text 2>/dev/null || echo "None")
+          if [ "$TG_ARN" != "None" ] && [ ! -z "$TG_ARN" ]; then
+            echo "🗑️  Deleting Target Group..."
+            aws elbv2 delete-target-group --target-group-arn "$TG_ARN"
+            echo "✅ Target Group deleted"
+          else
+            echo "ℹ️  No Target Group found"
+          fi
+
+          # 3. Delete Key Pair
+          aws ec2 delete-key-pair --key-name "ecommerce-lab-key" 2>/dev/null \
+            && echo "✅ Key Pair deleted" || echo "ℹ️  No Key Pair found"
+
+          # 4. Terminate EC2 instances and WAIT
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Name,Values=ecommerce-lab-web-*" \
+              "Name=instance-state-name,Values=running,stopped,pending" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text 2>/dev/null || echo "")
+          if [ ! -z "$INSTANCE_IDS" ]; then
+            echo "🗑️  Terminating EC2 instances: $INSTANCE_IDS"
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS > /dev/null
+            aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
+            echo "✅ EC2 instances terminated"
+          else
+            echo "ℹ️  No EC2 instances found"
+          fi
+
+          # 5. Delete ALL old ecommerce-lab VPCs and their dependencies
+          VPC_IDS=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=ecommerce-lab-vpc" \
+            --query 'Vpcs[].VpcId' \
+            --output text 2>/dev/null || echo "")
+          for VPC_ID in $VPC_IDS; do
+            echo "🗑️  Cleaning VPC: $VPC_ID"
+
+            # Delete NAT Gateways and WAIT (they take time)
+            NAT_IDS=$(aws ec2 describe-nat-gateways \
+              --filter "Name=vpc-id,Values=$VPC_ID" \
+              --query 'NatGateways[?State!=`deleted`].NatGatewayId' \
+              --output text 2>/dev/null || echo "")
+            for NAT in $NAT_IDS; do
+              echo "  🗑️  Deleting NAT Gateway: $NAT"
+              aws ec2 delete-nat-gateway --nat-gateway-id $NAT > /dev/null
+            done
+            if [ ! -z "$NAT_IDS" ]; then
+              echo "  ⏳ Waiting for NAT Gateways to delete (up to 60s)..."
+              sleep 60
+            fi
+
+            # Release EIPs associated with this VPC
+            for EIP in $(aws ec2 describe-addresses \
+              --filters "Name=domain,Values=vpc" \
+              --query 'Addresses[].AllocationId' \
+              --output text 2>/dev/null); do
+              aws ec2 release-address --allocation-id $EIP 2>/dev/null || true
+            done
+
+            # Detach and delete Internet Gateways
+            for IGW in $(aws ec2 describe-internet-gateways \
+              --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+              --query 'InternetGateways[].InternetGatewayId' \
+              --output text 2>/dev/null); do
+              aws ec2 detach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC_ID
+              aws ec2 delete-internet-gateway --internet-gateway-id $IGW
+            done
+
+            # Delete Subnets
+            for S in $(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'Subnets[].SubnetId' \
+              --output text 2>/dev/null); do
+              aws ec2 delete-subnet --subnet-id $S 2>/dev/null || true
+            done
+
+            # Delete Security Groups (non-default)
+            for SG in $(aws ec2 describe-security-groups \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+              --output text 2>/dev/null); do
+              aws ec2 delete-security-group --group-id $SG 2>/dev/null || true
+            done
+
+            # Delete non-main Route Tables
+            for RT in $(aws ec2 describe-route-tables \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' \
+              --output text 2>/dev/null); do
+              aws ec2 delete-route-table --route-table-id $RT 2>/dev/null || true
+            done
+
+            # Finally delete the VPC
+            aws ec2 delete-vpc --vpc-id $VPC_ID \
+              && echo "✅ VPC $VPC_ID deleted" \
+              || echo "⚠️  Could not delete VPC $VPC_ID (may have dependencies)"
+          done
+
+          echo "========================================="
+          echo "✅ Cleanup complete!"
+          echo "========================================="
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+
       - name: Terraform Format check
         run: terraform fmt -check
         continue-on-error: true
@@ -67,67 +206,6 @@ jobs:
             -out=tfplan
         env:
           TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
-
-      # -------------------------------------------------------
-      # Cleanup any leftover resources from previous failed runs
-      # so Terraform can create them fresh without conflicts
-      # -------------------------------------------------------
-      - name: Cleanup conflicting AWS resources
-        run: |
-          # Delete ALB listener first (so TG can be deleted)
-          ALB_ARN=$(aws elbv2 describe-load-balancers \
-            --names "ecommerce-lab-alb" \
-            --query 'LoadBalancers[0].LoadBalancerArn' \
-            --output text 2>/dev/null || echo "None")
-          if [ "$ALB_ARN" != "None" ] && [ ! -z "$ALB_ARN" ]; then
-            echo "🗑️  Deleting ALB listeners..."
-            LISTENER_ARNS=$(aws elbv2 describe-listeners \
-              --load-balancer-arn "$ALB_ARN" \
-              --query 'Listeners[].ListenerArn' \
-              --output text 2>/dev/null || echo "")
-            for L in $LISTENER_ARNS; do
-              aws elbv2 delete-listener --listener-arn "$L"
-            done
-
-            echo "🗑️  Deleting ALB..."
-            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN"
-            aws elbv2 wait load-balancers-deleted --load-balancer-arns "$ALB_ARN"
-            echo "✅ ALB deleted"
-          fi
-
-          # Now safe to delete Target Group
-          TG_ARN=$(aws elbv2 describe-target-groups \
-            --names "ecommerce-lab-tg" \
-            --query 'TargetGroups[0].TargetGroupArn' \
-            --output text 2>/dev/null || echo "None")
-          if [ "$TG_ARN" != "None" ] && [ ! -z "$TG_ARN" ]; then
-            echo "🗑️  Deleting Target Group..."
-            aws elbv2 delete-target-group --target-group-arn "$TG_ARN"
-            echo "✅ Target Group deleted"
-          fi
-
-          # Delete Key Pair
-          aws ec2 delete-key-pair --key-name "ecommerce-lab-key" 2>/dev/null || true
-          echo "✅ Key Pair deleted (if existed)"
-
-          # Terminate EC2 instances
-          INSTANCE_IDS=$(aws ec2 describe-instances \
-            --filters \
-              "Name=tag:Name,Values=ecommerce-lab-web-*" \
-              "Name=instance-state-name,Values=running,stopped,pending" \
-            --query 'Reservations[].Instances[].InstanceId' \
-            --output text 2>/dev/null || echo "")
-          if [ ! -z "$INSTANCE_IDS" ]; then
-            echo "🗑️  Terminating EC2 instances: $INSTANCE_IDS"
-            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS
-            aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
-            echo "✅ EC2 instances terminated"
-          fi
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
 
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
@@ -177,12 +255,13 @@ jobs:
       - name: Wait for EC2 instances to be ready
         run: |
           IPS="${{ needs.terraform.outputs.instance_ips }}"
-          if [ -z "$IPS" ]; then
+          if [ -z "$IPS" ] || [ "$IPS" = "," ]; then
             echo "❌ No IPs received from Terraform!"
             exit 1
           fi
           echo "Waiting for SSH on: $IPS"
           for ip in $(echo "$IPS" | tr ',' ' '); do
+            [ -z "$ip" ] && continue
             echo "Checking $ip..."
             READY=false
             for i in $(seq 1 20); do
@@ -208,13 +287,13 @@ jobs:
           IPS="${{ needs.terraform.outputs.instance_ips }}"
           echo "[web]" > ansible/inventory.ini
           for ip in $(echo "$IPS" | tr ',' ' '); do
+            [ -z "$ip" ] && continue
             echo "$ip ansible_user=ec2-user ansible_ssh_private_key_file=~/.ssh/deploy_key" \
               >> ansible/inventory.ini
           done
           echo "" >> ansible/inventory.ini
           echo "[web:vars]" >> ansible/inventory.ini
           echo "ansible_ssh_common_args='-o StrictHostKeyChecking=no'" >> ansible/inventory.ini
-
           echo "Generated inventory:"
           cat ansible/inventory.ini
 
@@ -242,9 +321,7 @@ jobs:
           echo ""
           echo "╔══════════════════════════════════════════════════╗"
           echo "║  🚀 Deployment complete!                         ║"
-          echo "║                                                  ║"
           echo "║  App URL: http://${{ needs.terraform.outputs.alb_dns }}"
-          echo "║                                                  ║"
           echo "║  Note: ALB may take 1-2 min for health checks   ║"
           echo "╚══════════════════════════════════════════════════╝"
 
@@ -288,4 +365,4 @@ jobs:
           TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
 
       - name: Confirm destruction
-        run: echo "✅ All AWS resources have been destroyed. No more charges."
+        run: echo "✅ All AWS resources have been destroyed."

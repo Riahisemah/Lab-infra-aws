@@ -1,0 +1,72 @@
+---
+- name: Deploy e-commerce application
+  hosts: web
+  become: yes
+
+  tasks:
+
+    - name: Install required packages
+      yum:
+        name: [docker, git, curl]
+        state: present
+
+    - name: Start Docker
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add ec2-user to docker group
+      user:
+        name: ec2-user
+        groups: docker
+        append: yes
+
+    - name: Install Docker Compose
+      get_url:
+        url: https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-linux-x86_64
+        dest: /usr/local/bin/docker-compose
+        mode: '0755'
+
+    - name: Create app directory
+      file:
+        path: /opt/ecommerce
+        state: directory
+        owner: ec2-user
+        group: ec2-user
+
+    - name: Copy app source code
+      synchronize:
+        src: ../
+        dest: /opt/ecommerce/
+        delete: yes
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=terraform"
+          - "--exclude=ansible"
+          - "--exclude=.github"
+
+    - name: Build and start containers
+      shell: docker-compose up -d --build --force-recreate
+      args:
+        chdir: /opt/ecommerce
+      become_user: ec2-user
+
+    - name: Wait for app to be healthy
+      uri:
+        url: http://localhost/health
+        status_code: 200
+      retries: 15
+      delay: 10
+      register: result
+      until: result.status == 200
+
+    - name: Show running containers
+      shell: docker-compose ps
+      args:
+        chdir: /opt/ecommerce
+      become_user: ec2-user
+      register: ps
+
+    - debug:
+        msg: "{{ ps.stdout_lines }}"

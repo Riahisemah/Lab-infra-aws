@@ -74,47 +74,43 @@ jobs:
       # -------------------------------------------------------
       - name: Cleanup conflicting AWS resources
         run: |
-          # Delete ALB if exists
+          # Delete ALB listener first (so TG can be deleted)
           ALB_ARN=$(aws elbv2 describe-load-balancers \
             --names "ecommerce-lab-alb" \
             --query 'LoadBalancers[0].LoadBalancerArn' \
             --output text 2>/dev/null || echo "None")
           if [ "$ALB_ARN" != "None" ] && [ ! -z "$ALB_ARN" ]; then
-            echo "🗑️  Deleting existing ALB: $ALB_ARN"
+            echo "🗑️  Deleting ALB listeners..."
+            LISTENER_ARNS=$(aws elbv2 describe-listeners \
+              --load-balancer-arn "$ALB_ARN" \
+              --query 'Listeners[].ListenerArn' \
+              --output text 2>/dev/null || echo "")
+            for L in $LISTENER_ARNS; do
+              aws elbv2 delete-listener --listener-arn "$L"
+            done
+
+            echo "🗑️  Deleting ALB..."
             aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN"
             aws elbv2 wait load-balancers-deleted --load-balancer-arns "$ALB_ARN"
             echo "✅ ALB deleted"
-          else
-            echo "ℹ️  No existing ALB found"
           fi
 
-          # Delete Target Group if exists
+          # Now safe to delete Target Group
           TG_ARN=$(aws elbv2 describe-target-groups \
             --names "ecommerce-lab-tg" \
             --query 'TargetGroups[0].TargetGroupArn' \
             --output text 2>/dev/null || echo "None")
           if [ "$TG_ARN" != "None" ] && [ ! -z "$TG_ARN" ]; then
-            echo "🗑️  Deleting existing Target Group: $TG_ARN"
+            echo "🗑️  Deleting Target Group..."
             aws elbv2 delete-target-group --target-group-arn "$TG_ARN"
             echo "✅ Target Group deleted"
-          else
-            echo "ℹ️  No existing Target Group found"
           fi
 
-          # Delete Key Pair if exists
-          KEY=$(aws ec2 describe-key-pairs \
-            --key-names "ecommerce-lab-key" \
-            --query 'KeyPairs[0].KeyName' \
-            --output text 2>/dev/null || echo "None")
-          if [ "$KEY" != "None" ] && [ ! -z "$KEY" ]; then
-            echo "🗑️  Deleting existing Key Pair"
-            aws ec2 delete-key-pair --key-name "ecommerce-lab-key"
-            echo "✅ Key Pair deleted"
-          else
-            echo "ℹ️  No existing Key Pair found"
-          fi
+          # Delete Key Pair
+          aws ec2 delete-key-pair --key-name "ecommerce-lab-key" 2>/dev/null || true
+          echo "✅ Key Pair deleted (if existed)"
 
-          # Terminate existing EC2 instances
+          # Terminate EC2 instances
           INSTANCE_IDS=$(aws ec2 describe-instances \
             --filters \
               "Name=tag:Name,Values=ecommerce-lab-web-*" \
@@ -122,12 +118,10 @@ jobs:
             --query 'Reservations[].Instances[].InstanceId' \
             --output text 2>/dev/null || echo "")
           if [ ! -z "$INSTANCE_IDS" ]; then
-            echo "🗑️  Terminating existing EC2 instances: $INSTANCE_IDS"
+            echo "🗑️  Terminating EC2 instances: $INSTANCE_IDS"
             aws ec2 terminate-instances --instance-ids $INSTANCE_IDS
             aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
             echo "✅ EC2 instances terminated"
-          else
-            echo "ℹ️  No existing EC2 instances found"
           fi
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}

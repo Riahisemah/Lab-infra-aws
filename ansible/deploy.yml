@@ -5,6 +5,7 @@
   gather_facts: no
   vars:
     ansible_python_interpreter: /usr/bin/python3
+    repo_url: "https://github.com/Riahisemah/Lab-infra-aws.git"
 
   tasks:
     - name: Install required packages
@@ -35,39 +36,23 @@
         dest: /usr/local/bin/docker-compose
         mode: "0755"
 
-    - name: Create app directory
+    - name: Remove old app directory if exists
       file:
         path: /opt/ecommerce
-        state: directory
-        owner: ec2-user
-        group: ec2-user
+        state: absent
 
-    - name: Copy app source code
-      synchronize:
-        src: ../app/
-        dest: /opt/ecommerce/app/
-        delete: yes
-      delegate_to: localhost
-
-    - name: Copy nginx configuration
-      synchronize:
-        src: ../nginx/
-        dest: /opt/ecommerce/nginx/
-        delete: yes
-      delegate_to: localhost
-
-    - name: Copy docker-compose file
-      copy:
-        src: ../docker-compose.yml
-        dest: /opt/ecommerce/docker-compose.yml
-        owner: ec2-user
-        group: ec2-user
+    - name: Clone repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: /opt/ecommerce
+        version: main
+        force: yes
+      become_user: ec2-user
 
     - name: Build and start containers
       shell: |
+        cd /opt/ecommerce
         sg docker -c "/usr/local/bin/docker-compose up -d --build --force-recreate"
-      args:
-        chdir: /opt/ecommerce
       become_user: ec2-user
 
     - name: Wait for app to be healthy
@@ -81,9 +66,8 @@
 
     - name: Show running containers
       shell: |
+        cd /opt/ecommerce
         sg docker -c "/usr/local/bin/docker-compose ps"
-      args:
-        chdir: /opt/ecommerce
       become_user: ec2-user
       register: ps
 

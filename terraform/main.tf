@@ -222,10 +222,10 @@ resource "aws_key_pair" "deployer" {
 # ============================================================
 resource "aws_instance" "web" {
   count         = var.instance_count
-  ami           = var.ami_id
+  ami           = data.aws_ami.amazon_linux_2023.id  # CHANGE THIS LINE!
   instance_type = var.instance_type
 
-  # Alternate between private subnets for HA
+  # Alternate between public subnets (for simplicity)
   subnet_id                   = count.index % 2 == 0 ? aws_subnet.public_a.id : aws_subnet.public_b.id
   associate_public_ip_address = true
 
@@ -240,7 +240,6 @@ resource "aws_instance" "web" {
 
   tags = { Name = "${var.project_name}-web-${count.index + 1}" }
 }
-
 # ============================================================
 # Application Load Balancer
 # ============================================================
